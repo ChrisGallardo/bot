@@ -230,6 +230,29 @@ class Verification(Cog):
 
         return result
 
+    async def _send_requests(self, coroutines: t.Collection[t.Coroutine]) -> int:
+        """
+        Execute `coroutines` and log bad statuses, if any.
+
+        The amount of successful requests is returned. If no requests fail, this number will
+        be equal to the length of `coroutines`.
+        """
+        log.info(f"Sending {len(coroutines)} requests")
+        n_success, bad_statuses = 0, set()
+
+        for coro in coroutines:
+            try:
+                await coro
+            except discord.HTTPException as http_exc:
+                bad_statuses.add(http_exc.status)
+            else:
+                n_success += 1
+
+        if bad_statuses:
+            log.info(f"{len(coroutines) - n_success} requests have failed due to following statuses: {bad_statuses}")
+
+        return n_success
+
     async def _kick_members(self, members: t.Collection[discord.Member]) -> int:
         """
         Kick `members` from the PyDis guild.
@@ -238,24 +261,19 @@ class Verification(Cog):
         requests. Failed requests are logged at info level.
         """
         log.info(f"Kicking {len(members)} members from the guild (not verified after {KICKED_AFTER} days)")
-        n_kicked, bad_statuses = 0, set()
 
-        for member in members:
-            if is_verified(member):  # Member could have verified in the meantime
-                continue
+        async def kick_request(member_: discord.Member) -> None:
+            """If `member_` still hasn't verified, send them `KICKED_MESSAGE` and kick them."""
+            if is_verified(member_):  # Member could have verified in the meantime
+                return
             with suppress(discord.Forbidden):
-                await member.send(KICKED_MESSAGE)  # Send message while user is still in guild
-            try:
-                await member.kick(reason=f"User has not verified in {KICKED_AFTER} days")
-            except discord.HTTPException as http_exc:
-                bad_statuses.add(http_exc.status)
-            else:
-                n_kicked += 1
+                await member_.send(KICKED_MESSAGE)  # Send message while user is still in guild
+            await member_.kick(reason=f"User has not verified in {KICKED_AFTER} days")
+
+        requests = [kick_request(member) for member in members]
+        n_kicked = await self._send_requests(requests)
 
         self.bot.stats.incr("verification.kicked", count=n_kicked)
-
-        if bad_statuses:
-            log.info(f"Failed to kick {len(members) - n_kicked} members due to following statuses: {bad_statuses}")
 
         return n_kicked
 
@@ -267,22 +285,17 @@ class Verification(Cog):
         are logged at info level.
         """
         log.info(f"Assigning {role} role to {len(members)} members (not verified after {UNVERIFIED_AFTER} days)")
-        n_success, bad_statuses = 0, set()
 
-        for member in members:
-            if is_verified(member):  # Member could have verified in the meantime
-                continue
-            try:
-                await member.add_roles(role, reason=f"User has not verified in {UNVERIFIED_AFTER} days")
-            except discord.HTTPException as http_exc:
-                bad_statuses.add(http_exc.status)
-            else:
-                n_success += 1
+        async def role_request(member_: discord.Member, role_: discord.Role) -> None:
+            """If `member_` still isn't verified, give them `role_`."""
+            if is_verified(member_):
+                return
+            await member_.add_roles(role_, reason=f"User has not verified in {UNVERIFIED_AFTER} days")
 
-        if bad_statuses:
-            log.info(f"Failed to assign {len(members) - n_success} roles due to following statuses: {bad_statuses}")
+        requests = [role_request(member, role) for member in members]
+        n_roles_added = await self._send_requests(requests)
 
-        return n_success
+        return n_roles_added
 
     async def _check_members(self) -> t.Tuple[t.Set[discord.Member], t.Set[discord.Member]]:
         """
